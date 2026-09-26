@@ -1,160 +1,209 @@
+import { useEffect, useMemo, useState } from "react";
 import "./styles.css";
+import { AppState, Customer, EyeParams, RecordStatus, Side } from "./types";
+import { loadState, newCustomer, saveState } from "./storage";
+import { buildVersion, confirmBlock, deriveStatus } from "./rules";
+import CustomerList from "./components/CustomerList";
+import FittingForm from "./components/FittingForm";
+import VersionHistory from "./components/VersionHistory";
 
-const project = {
-  "id": "hxwl-11",
-  "port": 5111,
-  "title": "眼科验光记录",
-  "subtitle": "视力、屈光参数与复查处方对比",
-  "stack": "React + Vite + TypeScript + CSS",
-  "theme": [
-    "#2563eb",
-    "#059669",
-    "#dc2626"
-  ],
-  "domain": "眼视光",
-  "users": [
-    "验光师",
-    "门店顾问",
-    "复查医生"
-  ],
-  "metrics": [
-    "近视进展",
-    "散光变化",
-    "复查提醒",
-    "处方数量"
-  ],
-  "filters": [
-    "儿童",
-    "成人",
-    "渐进片",
-    "角膜塑形镜"
-  ],
-  "fields": [
-    "裸眼视力",
-    "矫正视力",
-    "球镜",
-    "柱镜",
-    "轴位",
-    "瞳距",
-    "角膜曲率"
-  ],
-  "records": [
-    [
-      "Patient-032",
-      "儿童近视",
-      "复查",
-      "右眼-2.75DS，轴位180"
-    ],
-    [
-      "Patient-081",
-      "渐进片",
-      "初配",
-      "ADD +1.50，瞳高待确认"
-    ],
-    [
-      "Patient-144",
-      "散光",
-      "复查",
-      "柱镜变化0.50D"
-    ]
-  ]
-};
+const initialState = loadState();
 
-const statusColors = ["status-ok", "status-watch", "status-danger"];
-
-function MetricCard({ label, value, index }: { label: string; value: string; index: number }) {
-  return (
-    <article className="metric-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <i className={statusColors[index % statusColors.length]} />
-    </article>
+export default function App() {
+  const [state, setState] = useState<AppState>(initialState);
+  const [selectedId, setSelectedId] = useState<string | null>(
+    initialState.customers[0]?.id ?? null
   );
-}
+  const [filter, setFilter] = useState<RecordStatus | "all">("all");
+  const [toast, setToast] = useState<string>("");
 
-function App() {
-  const values = project.metrics.map((metric: string, index: number) => {
-    const base = [84, 12, 31, 7][index % 4];
-    return String(base + index * 3);
-  });
+  useEffect(() => {
+    saveState(state);
+  }, [state]);
+
+  const customers = state.customers;
+  const selected = customers.find((c) => c.id === selectedId) ?? null;
+
+  const counts = useMemo(() => {
+    const base: Record<RecordStatus, number> = { draft: 0, review: 0, paused: 0, confirmed: 0 };
+    customers.forEach((c) => {
+      base[deriveStatus(c)] += 1;
+    });
+    return base;
+  }, [customers]);
+
+  const visibleCustomers = useMemo(() => {
+    const list = [...customers].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return filter === "all" ? list : list.filter((c) => deriveStatus(c) === filter);
+  }, [customers, filter]);
+
+  function flash(msg: string) {
+    setToast(msg);
+    window.setTimeout(() => setToast(""), 2600);
+  }
+
+  function updateCustomer(id: string, mut: (c: Customer) => Customer) {
+    setState((s) => ({
+      ...s,
+      customers: s.customers.map((c) =>
+        c.id === id ? { ...mut(c), updatedAt: new Date().toISOString() } : c
+      ),
+    }));
+  }
+
+  const patch = (p: Partial<Customer>) => {
+    if (!selected) return;
+    // 不适分达到暂停线时置粘性标记，改低也需医生意见放行
+    if (
+      typeof p.discomfort === "number" &&
+      p.discomfort >= 4
+    ) {
+      p = { ...p, pausedOnce: true };
+    }
+    updateCustomer(selected.id, (c) => ({ ...c, ...p }));
+  };
+
+  const patchEye = (side: Side, key: keyof EyeParams, value: number | null) => {
+    if (!selected) return;
+    updateCustomer(selected.id, (c) => ({
+      ...c,
+      eyes: { ...c.eyes, [side]: { ...c.eyes[side], [key]: value } },
+    }));
+  };
+
+  function addCustomer() {
+    const c = newCustomer();
+    setState((s) => ({ ...s, customers: [c, ...s.customers] }));
+    setSelectedId(c.id);
+    setFilter("all");
+  }
+
+  function startAdjust() {
+    if (!selected) return;
+    updateCustomer(selected.id, (c) => ({
+      ...c,
+      adjustMode: true,
+      adjustReason: "",
+      // 新一轮试戴：清空旧试戴结果与暂停标记，要求重新试戴评分
+      trialMinutes: null,
+      discomfort: null,
+      pausedOnce: false,
+      doctorNote: "",
+    }));
+    flash("已进入改版：参数可编辑，调整并重新试戴后另存新版本，v" + selected.versions.length + " 保留可查");
+  }
+
+  function cancelAdjust() {
+    if (!selected) return;
+    // 放弃改版：恢复到最新已确认版本
+    updateCustomer(selected.id, (c) => {
+      const last = c.versions[c.versions.length - 1];
+      return {
+        ...c,
+        adjustMode: false,
+        adjustReason: "",
+        pausedOnce: last.discomfort >= 4,
+        eyes: JSON.parse(JSON.stringify(last.eyes)) as Customer["eyes"],
+        trialMinutes: last.trialMinutes,
+        discomfort: last.discomfort,
+        doctorNote: last.doctorNote,
+      };
+    });
+  }
+
+  function confirm(by: string) {
+    if (!selected) return;
+    const block = confirmBlock(selected);
+    if (!block.canConfirm) {
+      flash(block.reasons[0] ?? "暂不能确认");
+      return;
+    }
+    updateCustomer(selected.id, (c) => {
+      const v = buildVersion(c, by);
+      return {
+        ...c,
+        versions: [...c.versions, v],
+        adjustMode: false,
+        adjustReason: "",
+        pausedOnce: false,
+      };
+    });
+    const nextVersion = selected.versions.length + 1;
+    flash(nextVersion === 1 ? "已确认，v1 参数已存档" : `已另存为 v${nextVersion}，旧版本保留可查`);
+  }
 
   return (
     <main className="app-shell">
       <section className="hero">
         <div>
-          <p className="eyebrow">{project.id} · port {project.port}</p>
-          <h1>{project.title}</h1>
-          <p className="subtitle">{project.subtitle}</p>
+          <p className="eyebrow">hxwl-11 · 渐进多焦点试戴登记台</p>
+          <h1>老花渐进镜 · 试戴登记台</h1>
+          <p className="subtitle">
+            首次配渐进镜顾客专用：双眼远用球镜/柱镜/轴位、下加光、镜架瞳高与试戴时长逐项登记，
+            记录看远看近切换不适分。参数越界或不适超标先拦截复核，医生意见放行；确认后改参数另存版本，
+            数据本地保存，关掉页面再开仍在。
+          </p>
         </div>
         <div className="stack-card">
-          <span>技术栈</span>
-          <strong>{project.stack}</strong>
+          <span>待复核 / 暂停 / 已确认</span>
+          <strong>
+            {counts.review} 项待复核 · {counts.paused} 项暂停 · {counts.confirmed} 人已确认
+          </strong>
+          <span className="rule-hint">
+            ADD 0.75–3.00D · 瞳高偏离镜架中心 ≤4mm · 不适分 ≥4 暂停
+          </span>
         </div>
-      </section>
-
-      <section className="metrics-grid">
-        {project.metrics.map((metric: string, index: number) => (
-          <MetricCard key={metric} label={metric} value={values[index]} index={index} />
-        ))}
       </section>
 
       <section className="workspace">
-        <aside className="panel narrow">
-          <h2>角色</h2>
-          <div className="chips">
-            {project.users.map((user: string) => (
-              <span key={user}>{user}</span>
-            ))}
-          </div>
-          <h2>筛选</h2>
-          <div className="chips muted">
-            {project.filters.map((filter: string) => (
-              <button key={filter}>{filter}</button>
-            ))}
-          </div>
-        </aside>
+        <CustomerList
+          customers={visibleCustomers}
+          selectedId={selectedId}
+          filter={filter}
+          counts={counts}
+          onFilter={setFilter}
+          onSelect={setSelectedId}
+          onAdd={addCustomer}
+        />
 
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <p>{project.domain}</p>
-              <h2>记录字段</h2>
-            </div>
-            <button className="primary-action">新增记录</button>
-          </div>
-          <div className="field-grid">
-            {project.fields.map((field: string) => (
-              <label key={field}>
-                <span>{field}</span>
-                <input placeholder={"填写" + field} />
-              </label>
-            ))}
-          </div>
+        <section className="panel detail-panel">
+          {selected ? (
+            <>
+              <div className="detail-head">
+                <div>
+                  <p className="eyebrow">{selected.adjustMode ? "改版另存" : "试戴登记"}</p>
+                  <h2>{selected.name || "未命名顾客"}</h2>
+                </div>
+              </div>
+              <FittingForm
+                customer={selected}
+                patch={patch}
+                patchEye={patchEye}
+                onStartAdjust={startAdjust}
+                onCancelAdjust={cancelAdjust}
+                onConfirm={confirm}
+              />
+            </>
+          ) : (
+            <p className="empty-tip">请选择或新建一位顾客。</p>
+          )}
         </section>
       </section>
 
-      <section className="records panel">
-        <div className="section-heading">
-          <div>
-            <p>示例数据</p>
-            <h2>近期记录</h2>
+      {selected ? (
+        <section className="panel records">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">历史版本</p>
+              <h2>确认档案（旧记录可查）</h2>
+            </div>
+            <span className="version-count">共 {selected.versions.length} 个版本</span>
           </div>
-          <button>导出摘要</button>
-        </div>
-        <div className="record-list">
-          {project.records.map((record: string[], index: number) => (
-            <article key={record.join("-")} className="record-card">
-              <div className="record-index">{String(index + 1).padStart(2, "0")}</div>
-              <div>
-                <h3>{record[0]}</h3>
-                <p>{record.slice(1).join(" · ")}</p>
-              </div>
-            </article>
-          ))}
-        </div>
-      </section>
+          <VersionHistory customer={selected} />
+        </section>
+      ) : null}
+
+      {toast ? <div className="toast">{toast}</div> : null}
     </main>
   );
 }
-
-export default App;
